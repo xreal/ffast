@@ -1,0 +1,657 @@
+// snapshot.zig — Portable `.ffast` artifact writer/reader
+//
+// Produces a single binary file containing the full indexed state of a repo.
+// Any agent can read this file to understand the codebase without re-indexing.
+//
+// Format (all integers little-endian):
+//   Header (52 bytes):
+//     magic:         "CDB\x01"  (4 bytes)
+//     version:       u16
+//     flags:         u16         (reserved)
+//     git_head:      [40]u8      (hex SHA or zeroes)
+//     section_count: u32
+//   Section Table (section_count × 20 bytes):
+//     id:     u32    (section type)
+//     offset: u64    (byte offset from file start)
+//     length: u64    (byte length)
+//   Sections:
+//     TREE    (1): JSON array of {path, language, line_count, byte_size, symbol_count}
+//     OUTLINE (2): JSON object mapping path → [{name, kind, line, detail}]
+//     CONTENT (3): for each file: path_len(u16) + path + content_len(u32) + content
+//     FREQ    (5): 256×256×u16 LE frequency table
+//     META    (6): JSON {file_count, total_bytes, indexed_at, format_version}
+
+const std = @import("std");
+const compat = @import("compat.zig");
+const Explorer = @import("explore.zig").Explorer;
+const git_mod = @import("git.zig");
+
+const MAGIC = [4]u8{ 'C', 'D', 'B', 0x01 };
+const FORMAT_VERSION: u16 = 1;
+
+pub const SectionId = enum(u32) {
+    tree = 1,
+    outline = 2,
+    content = 3,
+    freq_table = 5,
+    meta = 6,
+};
+
+const SectionEntry = struct {
+    id: u32,
+    offset: u64,
+    length: u64,
+};
+
+/// Write a portable `.ffast` snapshot file.
+pub fn writeSnapshot(
+    explorer: *Explorer,
+    root_path: []const u8,
+    output_path: []const u8,
+    allocator: std.mem.Allocator,
+) !void {
+    const rand_suffix = std.crypto.random.int(u64);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ output_path, rand_suffix });
+    defer allocator.free(tmp_path);
+
+    var file = try std.fs.cwd().createFile(tmp_path, .{});
+
+    var sections: std.ArrayList(SectionEntry) = .{};
+    defer sections.deinit(allocator);
+
+    // Reserve space for header + section table (rewritten at end)
+    // Header: 52 bytes.  Section table: up to 5 sections × 20 = 100.
+    // Round to 256 for alignment.
+    const header_reserve: u64 = 256;
+    try file.seekTo(header_reserve);
+
+    explorer.mu.lockShared();
+    defer explorer.mu.unlockShared();
+
+    // ── Section: META ──
+    {
+        const offset = try file.getPos();
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(allocator);
+        const writer = buf.writer(allocator);
+        var total_bytes: u64 = 0;
+        var ct_iter = explorer.contents.valueIterator();
+        while (ct_iter.next()) |v| total_bytes += v.*.len;
+        var file_count_meta: u32 = 0;
+        var fc_iter = explorer.outlines.keyIterator();
+        while (fc_iter.next()) |k| {
+            if (!isSensitivePath(k.*)) file_count_meta += 1;
+        }
+
+        const root_hash = std.hash.Wyhash.hash(0, root_path);
+        try writer.print(
+            \\{{"file_count":{d},"total_bytes":{d},"indexed_at":{d},"format_version":{d},"root_hash":{d}}}
+        , .{
+            file_count_meta,
+            total_bytes,
+            std.time.timestamp(),
+            FORMAT_VERSION,
+            root_hash,
+        });
+        try file.writeAll(buf.items);
+        try sections.append(allocator, .{ .id = @intFromEnum(SectionId.meta), .offset = offset, .length = buf.items.len });
+    }
+
+    // ── Section: TREE ──
+    {
+        const offset = try file.getPos();
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(allocator);
+        const writer = buf.writer(allocator);
+        try writer.writeByte('[');
+        var first = true;
+        var iter = explorer.outlines.iterator();
+        while (iter.next()) |entry| {
+            if (isSensitivePath(entry.key_ptr.*)) continue;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            const outline = entry.value_ptr;
+            try writer.print(
+                \\{{"path":"{s}","language":"{s}","line_count":{d},"byte_size":{d},"symbol_count":{d}}}
+            , .{
+                entry.key_ptr.*,
+                @tagName(outline.language),
+                outline.line_count,
+                outline.byte_size,
+                outline.symbols.items.len,
+            });
+        }
+        try writer.writeByte(']');
+        try file.writeAll(buf.items);
+        try sections.append(allocator, .{ .id = @intFromEnum(SectionId.tree), .offset = offset, .length = buf.items.len });
+    }
+
+    // ── Section: OUTLINE ──
+    {
+        const offset = try file.getPos();
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(allocator);
+        const writer = buf.writer(allocator);
+        try writer.writeByte('{');
+        var first = true;
+        var iter = explorer.outlines.iterator();
+        while (iter.next()) |entry| {
+            if (isSensitivePath(entry.key_ptr.*)) continue;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("\"{s}\":[", .{entry.key_ptr.*});
+            for (entry.value_ptr.symbols.items, 0..) |sym, si| {
+                if (si > 0) try writer.writeByte(',');
+                try writer.print(
+                    \\{{"name":"{s}","kind":"{s}","line":{d}
+                , .{ sym.name, @tagName(sym.kind), sym.line_start });
+                if (sym.detail) |d| {
+                    try writer.print(",\"detail\":\"{s}\"", .{d});
+                }
+                try writer.writeByte('}');
+            }
+            try writer.writeByte(']');
+        }
+        try writer.writeByte('}');
+        try file.writeAll(buf.items);
+        try sections.append(allocator, .{ .id = @intFromEnum(SectionId.outline), .offset = offset, .length = buf.items.len });
+    }
+
+    // ── Section: CONTENT ──
+    {
+        const offset = try file.getPos();
+        var ct_iter = explorer.contents.iterator();
+        while (ct_iter.next()) |entry| {
+            const path = entry.key_ptr.*;
+            // Skip sensitive files that may contain secrets
+            if (isSensitivePath(path)) continue;
+            const content = entry.value_ptr.*;
+            var pl_buf: [2]u8 = undefined;
+            std.mem.writeInt(u16, &pl_buf, @intCast(path.len), .little);
+            try file.writeAll(&pl_buf);
+            try file.writeAll(path);
+            var cl_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &cl_buf, @intCast(content.len), .little);
+            try file.writeAll(&cl_buf);
+            try file.writeAll(content);
+        }
+        const end = try file.getPos();
+        try sections.append(allocator, .{ .id = @intFromEnum(SectionId.content), .offset = offset, .length = end - offset });
+    }
+
+    // ── Section: FREQ TABLE ──
+    {
+        const offset = try file.getPos();
+        const index_mod = @import("index.zig");
+        const table = index_mod.active_pair_freq;
+        var row_buf: [256 * 2]u8 = undefined;
+        for (table) |row| {
+            for (row, 0..) |val, j| {
+                std.mem.writeInt(u16, row_buf[j * 2 ..][0..2], val, .little);
+            }
+            try file.writeAll(&row_buf);
+        }
+        const end = try file.getPos();
+        try sections.append(allocator, .{ .id = @intFromEnum(SectionId.freq_table), .offset = offset, .length = end - offset });
+    }
+
+    // ── Write header + section table at file start ──
+    try file.seekTo(0);
+
+    try file.writeAll(&MAGIC);
+    var ver_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &ver_buf, FORMAT_VERSION, .little);
+    try file.writeAll(&ver_buf);
+    try file.writeAll(&[2]u8{ 0, 0 }); // flags
+
+    const git_head = git_mod.getGitHead(root_path, allocator) catch null;
+    if (git_head) |head| {
+        try file.writeAll(&head);
+    } else {
+        try file.writeAll(&([_]u8{0x00} ** 40));
+    }
+
+    var sc_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &sc_buf, @intCast(sections.items.len), .little);
+    try file.writeAll(&sc_buf);
+
+    for (sections.items) |sec| {
+        var id_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &id_buf, sec.id, .little);
+        try file.writeAll(&id_buf);
+        var off_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &off_buf, sec.offset, .little);
+        try file.writeAll(&off_buf);
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, sec.length, .little);
+        try file.writeAll(&len_buf);
+    }
+
+    file.close();
+    file = undefined;
+    std.fs.cwd().rename(tmp_path, output_path) catch |err| {
+        // If rename fails (e.g. output_path is a directory), clean up tmp
+        std.fs.cwd().deleteFile(tmp_path) catch {};
+        return err;
+    };
+}
+
+/// Read section table from a `.ffast` file.
+pub fn readSections(path: []const u8, allocator: std.mem.Allocator) !?std.AutoHashMap(u32, SectionEntry) {
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+
+    var magic_buf: [4]u8 = undefined;
+    const n = file.readAll(&magic_buf) catch return null;
+    if (n != 4 or !std.mem.eql(u8, &magic_buf, &MAGIC)) return null;
+
+    file.seekBy(44) catch return null; // skip version + flags + git_head
+
+    var sc_buf: [4]u8 = undefined;
+    const scn = file.readAll(&sc_buf) catch return null;
+    if (scn != 4) return null;
+    const section_count = std.mem.readInt(u32, &sc_buf, .little);
+
+    var result = std.AutoHashMap(u32, SectionEntry).init(allocator);
+    errdefer result.deinit();
+
+    for (0..section_count) |_| {
+        var entry_buf: [20]u8 = undefined;
+        const en = file.readAll(&entry_buf) catch return null;
+        if (en != 20) return null;
+        try result.put(
+            std.mem.readInt(u32, entry_buf[0..4], .little),
+            .{
+                .id = std.mem.readInt(u32, entry_buf[0..4], .little),
+                .offset = std.mem.readInt(u64, entry_buf[4..12], .little),
+                .length = std.mem.readInt(u64, entry_buf[12..20], .little),
+            },
+        );
+    }
+    return result;
+}
+
+/// Read a section's raw bytes from a `.ffast` file.
+pub fn readSectionBytes(path: []const u8, section_id: SectionId, allocator: std.mem.Allocator) !?[]u8 {
+    var sections = try readSections(path, allocator) orelse return null;
+    defer sections.deinit();
+
+    const entry = sections.get(@intFromEnum(section_id)) orelse return null;
+    if (entry.length > 256 * 1024 * 1024) return null; // sanity cap: 256MB
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    // Validate section fits within file
+    const stat = try compat.fileStat(file);
+    if (entry.offset + entry.length > stat.size) return null;
+
+    try file.seekTo(entry.offset);
+    const buf = try allocator.alloc(u8, @intCast(entry.length));
+    errdefer allocator.free(buf);
+    const n = try file.readAll(buf);
+    if (n != buf.len) {
+        allocator.free(buf);
+        return null;
+    }
+    return buf;
+}
+
+/// Read the git HEAD stored in a snapshot file header. Returns null if
+/// the file doesn't exist, is invalid, or has an all-zero HEAD.
+pub fn readSnapshotGitHead(path: []const u8) ?[40]u8 {
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+
+    var magic_buf: [4]u8 = undefined;
+    const mn = file.readAll(&magic_buf) catch return null;
+    if (mn != 4) return null;
+    if (!std.mem.eql(u8, &magic_buf, &MAGIC)) return null;
+
+    file.seekBy(4) catch return null; // skip version + flags
+
+    var head_buf: [40]u8 = undefined;
+    const hn = file.readAll(&head_buf) catch return null;
+    if (hn != 40) return null;
+
+    // Return null for all-zero sentinel (no git HEAD available)
+    if (std.mem.allEqual(u8, &head_buf, 0x00)) return null;
+    // Also handle legacy 0xFF sentinel from older versions
+    if (std.mem.allEqual(u8, &head_buf, 0xFF)) return null;
+
+    return head_buf;
+}
+
+/// Load a snapshot into an Explorer. Populates contents and outlines.
+/// Returns true on success, false if the snapshot couldn't be loaded.
+pub fn loadSnapshot(
+    snapshot_path: []const u8,
+    explorer: *Explorer,
+    store: *@import("store.zig").Store,
+    allocator: std.mem.Allocator,
+) bool {
+    return loadSnapshotValidated(snapshot_path, null, explorer, store, allocator);
+}
+
+/// Load a snapshot with optional repo identity validation.
+/// If `expected_root` is non-null, the snapshot's root_hash must match.
+pub fn loadSnapshotValidated(
+    snapshot_path: []const u8,
+    expected_root: ?[]const u8,
+    explorer: *Explorer,
+    store: *@import("store.zig").Store,
+    allocator: std.mem.Allocator,
+) bool {
+    // Clean up stale temp files from previous crashed writers
+    cleanupStaleTmpFiles(snapshot_path);
+
+    const file = std.fs.cwd().openFile(snapshot_path, .{}) catch return false;
+    defer file.close();
+
+    // Validate magic
+    var magic_buf: [4]u8 = undefined;
+    const lmn = file.readAll(&magic_buf) catch return false;
+    if (lmn != 4) return false;
+    if (!std.mem.eql(u8, &magic_buf, &MAGIC)) return false;
+
+    // Read section table
+    const sections_opt = readSections(snapshot_path, allocator) catch return false;
+    var sections = sections_opt orelse return false;
+    defer sections.deinit();
+
+    // Parse META section to get expected file_count and root_hash
+    var expected_file_count: ?u32 = null;
+    var meta_root_hash: ?u64 = null;
+    if (sections.get(@intFromEnum(SectionId.meta))) |meta_entry| {
+        const meta_bytes = readSectionBytes(snapshot_path, .meta, allocator) catch null;
+        if (meta_bytes) |mb| {
+            defer allocator.free(mb);
+            // Simple integer extraction from JSON: "file_count":NNN
+            if (parseJsonU32(mb, "file_count")) |fc| {
+                expected_file_count = fc;
+            }
+            if (parseJsonU64(mb, "root_hash")) |rh| {
+                meta_root_hash = rh;
+            }
+            _ = meta_entry;
+        }
+    }
+
+    // Validate repo identity if requested (issue-41)
+    if (expected_root) |root| {
+        const expected_hash = std.hash.Wyhash.hash(0, root);
+        if (meta_root_hash) |stored_hash| {
+            if (stored_hash != expected_hash) return false;
+        } else {
+            // No root_hash in snapshot — reject if caller requires validation
+            return false;
+        }
+    }
+
+    // Load CONTENT section — this is the core data
+    const content_entry = sections.get(@intFromEnum(SectionId.content)) orelse return false;
+
+    const content_file = std.fs.cwd().openFile(snapshot_path, .{}) catch return false;
+    defer content_file.close();
+
+    // Validate content section fits within actual file size (issue-40: truncation detection)
+    const file_stat = compat.fileStat(content_file) catch return false;
+    const file_size = file_stat.size;
+    if (content_entry.offset + content_entry.length > file_size) return false;
+
+    content_file.seekTo(content_entry.offset) catch return false;
+
+    const snap_mtime: i128 = file_stat.mtime;
+    var bytes_read: u64 = 0;
+    var file_count: u32 = 0;
+    while (bytes_read < content_entry.length) {
+        // Read path_len(u16)
+        var pl_buf: [2]u8 = undefined;
+        const pln = content_file.readAll(&pl_buf) catch return false;
+        if (pln != 2) break;
+        const path_len = std.mem.readInt(u16, &pl_buf, .little);
+        if (path_len == 0 or path_len > 4096) break; // sanity cap
+        bytes_read += 2;
+
+        // Read path
+        const path_buf = allocator.alloc(u8, path_len) catch return false;
+        defer allocator.free(path_buf);
+        const prn = content_file.readAll(path_buf) catch return false;
+        if (prn != path_len) break;
+        bytes_read += path_len;
+
+        // Read content_len(u32)
+        var cl_buf: [4]u8 = undefined;
+        const cln = content_file.readAll(&cl_buf) catch return false;
+        if (cln != 4) break;
+        const content_len = std.mem.readInt(u32, &cl_buf, .little);
+        if (content_len > 64 * 1024 * 1024) break; // sanity cap: 64MB per file
+        bytes_read += 4;
+
+        // Read content
+        const content = allocator.alloc(u8, content_len) catch return false;
+        defer allocator.free(content);
+        const crn = content_file.readAll(content) catch return false;
+        if (crn != content_len) break;
+        bytes_read += content_len;
+
+        // Re-index from disk if file was modified after the snapshot
+        var disk_content: ?[]u8 = null;
+        if (snap_mtime > 0) blk: {
+            const df = std.fs.cwd().openFile(path_buf, .{}) catch break :blk;
+            defer df.close();
+            const ds = compat.fileStat(df) catch break :blk;
+            if (ds.mtime <= snap_mtime) break :blk;
+            disk_content = df.readToEndAlloc(allocator, 16 * 1024 * 1024) catch break :blk;
+        }
+        defer if (disk_content) |dc| allocator.free(dc);
+        const effective = if (disk_content) |dc| dc else content;
+
+        // Index into explorer (this dupes path and content internally)
+        explorer.indexFile(path_buf, effective) catch continue;
+
+        // Record in store for sequence tracking
+        const hash = std.hash.Wyhash.hash(0, effective);
+        _ = store.recordSnapshot(path_buf, effective.len, hash) catch {};
+
+        file_count += 1;
+    }
+
+    // Validate file_count matches META expectation (issue-40)
+    if (expected_file_count) |expected| {
+        if (file_count != expected) return false;
+    } else if (file_count == 0) {
+        // No META and no files loaded — corrupt or empty snapshot
+        return false;
+    }
+
+    // Load frequency table if present
+    if (sections.get(@intFromEnum(SectionId.freq_table))) |freq_entry| {
+        if (freq_entry.length == 256 * 256 * 2) {
+            const index_mod = @import("index.zig");
+            const ft = allocator.create([256][256]u16) catch return file_count > 0;
+            const freq_file = std.fs.cwd().openFile(snapshot_path, .{}) catch return file_count > 0;
+            defer freq_file.close();
+            freq_file.seekTo(freq_entry.offset) catch {
+                allocator.destroy(ft);
+                return file_count > 0;
+            };
+            var row_buf: [256 * 2]u8 = undefined;
+            for (0..256) |a| {
+                if (freq_file.readAll(&row_buf) catch {
+                    allocator.destroy(ft);
+                    return file_count > 0;
+                } != 512) {
+                    allocator.destroy(ft);
+                    return file_count > 0;
+                }
+                for (0..256) |b| {
+                    ft[a][b] = std.mem.readInt(u16, row_buf[b * 2 ..][0..2], .little);
+                }
+            }
+            index_mod.setFrequencyTable(ft);
+            allocator.destroy(ft);
+        }
+    }
+
+    return true;
+}
+
+fn parseJsonU32(json: []const u8, key: []const u8) ?u32 {
+    const val = parseJsonU64(json, key) orelse return null;
+    return if (val <= std.math.maxInt(u32)) @intCast(val) else null;
+}
+
+fn parseJsonU64(json: []const u8, key: []const u8) ?u64 {
+    var i: usize = 0;
+    while (i + key.len + 2 <= json.len) : (i += 1) {
+        if (json[i] == '"' and
+            i + 1 + key.len + 1 <= json.len and
+            std.mem.eql(u8, json[i + 1 .. i + 1 + key.len], key) and
+            json[i + 1 + key.len] == '"')
+        {
+            var j = i + 2 + key.len;
+            while (j < json.len and (json[j] == ':' or json[j] == ' ')) j += 1;
+            const start = j;
+            while (j < json.len and json[j] >= '0' and json[j] <= '9') j += 1;
+            if (j > start) {
+                return std.fmt.parseInt(u64, json[start..j], 10) catch null;
+            }
+        }
+    }
+    return null;
+}
+
+pub const SecondaryCheckpoint = struct {
+    processed_files: u32,
+    queued_files: u32,
+};
+
+pub fn readSecondaryCheckpoint(path: []const u8, allocator: std.mem.Allocator) !SecondaryCheckpoint {
+    // Try to read meta section from binary snapshot first
+    const meta_bytes = readSectionBytes(path, .meta, allocator) catch null;
+    if (meta_bytes) |mb| {
+        defer allocator.free(mb);
+        return .{
+            .processed_files = parseJsonU32(mb, "tier2_processed") orelse 0,
+            .queued_files = parseJsonU32(mb, "tier2_queued") orelse 0,
+        };
+    }
+    // Fallback: read raw file as JSON (for tests with simple JSON files)
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    const data = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+    return .{
+        .processed_files = parseJsonU32(data, "tier2_processed") orelse 0,
+        .queued_files = parseJsonU32(data, "tier2_queued") orelse 0,
+    };
+}
+
+pub fn readSecondaryCheckpointForTest(path: []const u8, allocator: std.mem.Allocator) !SecondaryCheckpoint {
+    return readSecondaryCheckpoint(path, allocator);
+}
+
+/// Returns true if a file path looks like it may contain secrets.
+/// These files are excluded from snapshots to prevent accidental exposure.
+fn isSensitivePath(path: []const u8) bool {
+    const sensitive_names = [_][]const u8{
+        ".env",
+        ".env.local",
+        ".env.production",
+        ".env.development",
+        ".env.staging",
+        ".env.test",
+        ".dev.vars",
+        "credentials.json",
+        "service-account.json",
+        "secrets.json",
+        "secrets.yaml",
+        "secrets.yml",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        "id_rsa",
+        "id_ed25519",
+        ".pem",
+    };
+
+    // Check exact filename (basename)
+    const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[sep + 1 ..] else path;
+
+    for (sensitive_names) |name| {
+        if (std.mem.eql(u8, basename, name)) return true;
+    }
+
+    // Check if basename starts with .env (catches .env.anything)
+    if (basename.len >= 4 and std.mem.eql(u8, basename[0..4], ".env")) return true;
+
+    // Check extensions
+    if (endsWith(basename, ".pem")) return true;
+    if (endsWith(basename, ".key")) return true;
+    if (endsWith(basename, ".p12")) return true;
+    if (endsWith(basename, ".pfx")) return true;
+    if (endsWith(basename, ".jks")) return true;
+
+    // Check directory patterns
+    if (std.mem.indexOf(u8, path, ".ssh/") != null) return true;
+    if (std.mem.indexOf(u8, path, ".gnupg/") != null) return true;
+    if (std.mem.indexOf(u8, path, ".aws/") != null) return true;
+
+    return false;
+}
+
+fn endsWith(s: []const u8, suffix: []const u8) bool {
+    if (s.len < suffix.len) return false;
+    return std.mem.eql(u8, s[s.len - suffix.len ..], suffix);
+}
+
+fn cleanupStaleTmpFiles(output_path: []const u8) void {
+    // Derive parent directory and basename from output_path
+    const sep = std.mem.lastIndexOfScalar(u8, output_path, '/');
+    const dir_path = if (sep) |s| output_path[0..s] else ".";
+    const basename = if (sep) |s| output_path[s + 1 ..] else output_path;
+
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const name = entry.name;
+        // Match: starts with basename, ends with .tmp
+        if (name.len > basename.len and
+            std.mem.startsWith(u8, name, basename) and
+            endsWith(name, ".tmp"))
+        {
+            dir.deleteFile(name) catch {};
+        }
+    }
+}
+
+pub fn writeSnapshotDual(
+    explorer: *Explorer,
+    root_path: []const u8,
+    output_path: []const u8,
+    allocator: std.mem.Allocator,
+) !void {
+    try writeSnapshot(explorer, root_path, output_path, allocator);
+
+    const hash = std.hash.Wyhash.hash(0, root_path);
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return;
+    defer allocator.free(home);
+    const secondary = std.fmt.allocPrint(allocator, "{s}/.ffast/projects/{x}/ffast.snapshot", .{ home, hash }) catch return;
+    defer allocator.free(secondary);
+
+    const dir_path = std.fmt.allocPrint(allocator, "{s}/.ffast/projects/{x}", .{ home, hash }) catch return;
+    defer allocator.free(dir_path);
+    compat.makePath(std.fs.cwd(), dir_path) catch {};
+
+    const proj_txt = std.fmt.allocPrint(allocator, "{s}/project.txt", .{dir_path}) catch return;
+    defer allocator.free(proj_txt);
+    if (std.fs.cwd().createFile(proj_txt, .{})) |f| {
+        f.writeAll(root_path) catch {};
+        f.close();
+    } else |_| {}
+
+    writeSnapshot(explorer, root_path, secondary, allocator) catch {};
+}
