@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix="ffast-perf-") as td:
     (root / "app" / "one").mkdir(parents=True)
     (root / "app" / "two").mkdir(parents=True)
 
-    for i in range(250):
+    for i in range(1500):
         (root / "app" / "one" / f"f{i}.zig").write_text("pub fn a() void {}\n")
         (root / "app" / "two" / f"f{i}.php").write_text("<?php function x() {}\n")
 
