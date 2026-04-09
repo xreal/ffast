@@ -4,3 +4,4 @@ zig-out/
 dist/
 ffast.snapshot
 docs/
+AGENTS.md
